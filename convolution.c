@@ -21,6 +21,7 @@
 
 #include <ctype.h>
 #include <mpi.h>
+#include <omp.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
@@ -50,7 +51,7 @@ int validateParameters(char**);
 double calculateExtraSize(int partitions);
 long rebuildImage(ImageData, DataBucket*);
 long calcRasterWriteAmount(int*, long, long);
-long calculateWriteAmount(ImageData, int, int, int);
+long calculateWriteAmount(char**, ImageData, int, int, int);
 
 //--------------------------------------------------------------------------//
 // -- LIBRARY IMPLEMENTATION ---------------------------------------------- //
@@ -208,29 +209,17 @@ int initfilestore(ImageData img, FILE** fp, char* fileName, long *position) {
 }
 
 // Writing the image chunk to the resulting file.
-int savingChunk(ImageData img, MPI_File *mfp, long *offset, long dataOffst, 
+int savingChunk(char** img, MPI_File *mfp, long *offset, long dataOffst, 
     long count, long writeAmount){
 
     long end = count + dataOffst;
     MPI_Status status;
 
-    char *obuff = NULL;
-
-    obuff = malloc(sizeof(char) * (writeAmount + 1));
-
-    for(long i = dataOffst, k = 0; i < end; i++) {
-        k += sprintf(&obuff[k], "%d ", img->R[i]);
-        k += sprintf(&obuff[k], "%d ", img->G[i]);
-        k += sprintf(&obuff[k], "%d\n", img->B[i]);
-    }
-
     MPI_File_set_view(*mfp, *offset, MPI_CHAR, MPI_CHAR, "native", 
         MPI_INFO_NULL);
 
     // Writing image partition
-    MPI_File_write(*mfp, (void*) &obuff[0], writeAmount, MPI_CHAR, &status);
-
-    free(obuff);
+    MPI_File_write(*mfp, (void*) *img, writeAmount, MPI_CHAR, &status);
 
     return 0;
 }
@@ -448,32 +437,44 @@ long rebuildImage(ImageData img, DataBucket *bucks) {
     return (tsize / 3);
 }
 
-long calcRasterWriteAmount(int *raster, long offset, long end) {
+long calculateWriteAmount(char **data, ImageData img, int offset, 
+    int chunksize, int imgWidth) {
 
-    long wAmount = 0L;
+    char *buff = NULL, c;
 
-    char value[10];
-
-    while(offset < end) {
-        wAmount += sprintf(&value[0], "%d", raster[offset]);
-        wAmount += 1; // Seperator character = 1 byte
-        offset++;
-    }
-
-    return wAmount;
-}
-
-long calculateWriteAmount(ImageData img, int offset, int chunksize, 
-    int imgWidth) {
-
-    long i = offset * imgWidth, 
+    long i = offset * imgWidth, k = 0L, 
          end = (chunksize * imgWidth) + i;
+
+    int flip = 0, value = 0, increase = 0;
 
     long writeAmount = 0L;
 
-    writeAmount += calcRasterWriteAmount(img->R, i, end);
-    writeAmount += calcRasterWriteAmount(img->G, i, end);
-    writeAmount += calcRasterWriteAmount(img->B, i ,end);
+    buff = malloc(sizeof(char) * 5 * 3 * img->rsize);
+
+    while(i < end) {
+        switch(flip) {
+            case 0:
+                value = img->R[i];
+                c = ' ';
+                break;
+            case 1:
+                value = img->G[i];
+                c = ' ';
+                break;
+            default:
+                value = img->B[i];
+                c = '\n';
+                i++;
+                break;
+        }
+
+        increase = sprintf(&buff[k], "%d%c", value, c);
+        k += increase;
+        writeAmount += increase;
+        flip = (flip + 1) % 3;
+    }
+
+    *data = buff;
 
     return writeAmount;
 }
@@ -497,7 +498,7 @@ int main(int argc, char **argv) {
     double start, tstart, tend, tread, tcopy, tconv, tstore, treadk;
     float extraSizeFactor;
 
-    char *sourceFile, *outFile, *kernFile;
+    char *sourceFile, *outFile, *kernFile, **outData;
     char cwd[1024];
 
     FILE *fpsrc, *fpdst;
@@ -539,6 +540,9 @@ int main(int argc, char **argv) {
         return -1;
     }
 
+    omp_set_dynamic(FALSE);
+    omp_set_num_threads(3);
+
     MPI_Init(&argc, &argv);
 
     start = MPI_Wtime();
@@ -556,6 +560,8 @@ int main(int argc, char **argv) {
     effectivePart = partitions * pnum;
 
     writeOffs = (long*) malloc(sizeof(long) * pnum);
+
+    outData = (char**) malloc(sizeof(char*));
 
     getcwd(cwd, sizeof(cwd));
 
@@ -658,8 +664,6 @@ int main(int argc, char **argv) {
              return -1;
         }
 
-        tread = tread + (MPI_Wtime() - start);
-
         if(pnum > 1) {
             transferUnalignedRasters(prank, pnum, buckets[0], imgWidth);
         }
@@ -674,6 +678,8 @@ int main(int argc, char **argv) {
         // Copying data from the DataBucket into the ImageData arrays
         //if(gPrank == 0 && c < 1)
         iterSize = rebuildImage(source, buckets);
+
+        tread = tread + (MPI_Wtime() - start);
 
         // Discarding incomplete row.
         convOffset = (iterSize % imgWidth);
@@ -706,18 +712,29 @@ int main(int argc, char **argv) {
         //------------------------------------------------------------------//
         start = MPI_Wtime();
 
-        convolve2D(source->R, output->R, imgWidth, chunkSize, 
-        	offset, kern->vkern, kern->kernelX, kern->kernelY);
-        convolve2D(source->G, output->G, imgWidth, chunkSize, 
-        	offset, kern->vkern, kern->kernelX, kern->kernelY);
-        convolve2D(source->B, output->B, imgWidth, chunkSize, 
-        	offset, kern->vkern, kern->kernelX, kern->kernelY);
+        #pragma omp parallel
+        {
+            #pragma omp sections 
+            {
+                #pragma omp section
+                    convolve2D(source->R, output->R, imgWidth, chunkSize, 
+                        offset, kern->vkern, kern->kernelX, kern->kernelY);
+                #pragma omp section
+                    convolve2D(source->G, output->G, imgWidth, chunkSize, 
+                        offset, kern->vkern, kern->kernelX, kern->kernelY);
+                #pragma omp section
+                    convolve2D(source->B, output->B, imgWidth, chunkSize, 
+                        offset, kern->vkern, kern->kernelX, kern->kernelY);
+            }
+        }
         
         tconv = MPI_Wtime() - start;
 
         //------------------------------------------------------------------//
         // - CHUNK SAVING --------------------------------------------------//
         //------------------------------------------------------------------//
+
+        start = MPI_Wtime();
 
         if(pc > 0) {
             offset = haloSize;
@@ -731,7 +748,7 @@ int main(int argc, char **argv) {
             chunkSize = (convSize / imgWidth) - haloSize;
         }
 
-        writeSize = calculateWriteAmount(output, offset, chunkSize, 
+        writeSize = calculateWriteAmount(outData, output, offset, chunkSize, 
             imgWidth);
 
         MPI_Allgather((void*) &writeSize, 1, MPI_LONG, (void*) &writeOffs[0], 
@@ -746,13 +763,13 @@ int main(int argc, char **argv) {
             totalWritten = totalWritten + writeOffs[i];
         }
 
-        start = MPI_Wtime();
-
-        if (savingChunk(output, mfpdst, &position, (offset * imgWidth), 
+        if (savingChunk(outData, mfpdst, &position, (offset * imgWidth), 
                         (chunkSize * imgWidth), writeSize)) {
             perror("Error: ");
             return -1;
         }
+
+        *outData = NULL;
 
         tstore = tstore + (MPI_Wtime() - start);
 
@@ -777,7 +794,7 @@ int main(int argc, char **argv) {
 
     if(prank == 0) {
     
-        /*printf("-----------------------------------\n");
+        printf("-----------------------------------\n");
         printf("|       TYPE SIZES (BYTES)        |\n");
         printf("-----------------------------------\n");
         printf("Size of short: ----> %ld\n", sizeof(short));
@@ -809,8 +826,8 @@ int main(int argc, char **argv) {
         printf("%.6lfs elapsed in writing the resulting image.\n", tstore);
         printf("-----------------------------------\n");
         printf("%.6lfs elapsed in total.\n", tend-tstart);
-        printf("-----------------------------------\n");*/
-        printf("%s %s %d %.3lf\n", sourceFile, kernFile, pnum, tend-tstart);
+        printf("-----------------------------------\n");
+        //printf("%s %s %d %.3lf\n", sourceFile, kernFile, pnum, tend-tstart);
     }
 
     //----------------------------------------------------------------------//
@@ -826,6 +843,7 @@ int main(int argc, char **argv) {
     free(mfpsrc);
     free(mfpdst);
     free(writeOffs);
+    free(outData);
 
     //----------------------------------------------------------------------//
 

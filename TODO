@@ -2,6 +2,4 @@ TODO at 30/05/2016
 
 -Try to fix convolution algorithm
 
--Add OpenMP directives
-
--Optimize write process
+-Optimize calculateWriteAmount algorithm

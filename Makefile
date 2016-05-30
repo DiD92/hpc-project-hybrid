@@ -1,11 +1,12 @@
 SRC=convolution.c ppmparser.c
 LIB=lib
-DST=convolution-mpi
+DST=convolution-hyb
 OPTS=-std=c99 -Wall -Wextra -pedantic-errors -O2 -g
+INC=-fopenmp
 CC=mpicc
 
-conv-omp: $(SRC) $(LIB)
-	@$(CC) $(OPTS) $(SRC) -L $(LIB) -o $(DST)
+conv-hyb: $(SRC) $(LIB)
+	@$(CC) $(OPTS) $(SRC) -L $(LIB) -o $(DST) $(INC)
 	@echo Compilation complete!
 
 clean: $(DST)
