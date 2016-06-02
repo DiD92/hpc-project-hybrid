@@ -51,7 +51,7 @@ int validateParameters(char**);
 double calculateExtraSize(int partitions);
 long rebuildImage(ImageData, DataBucket*);
 long calcRasterWriteAmount(int*, long, long);
-long calculateWriteAmount(char**, ImageData, int, int, int);
+long calculateWriteAmount(OutputBucket, ImageData, int, int, int);
 
 //--------------------------------------------------------------------------//
 // -- LIBRARY IMPLEMENTATION ---------------------------------------------- //
@@ -209,17 +209,22 @@ int initfilestore(ImageData img, FILE** fp, char* fileName, long *position) {
 }
 
 // Writing the image chunk to the resulting file.
-int savingChunk(char** img, MPI_File *mfp, long *offset, long dataOffst, 
-    long count, long writeAmount){
+int savingChunk(OutputBucket out, MPI_File *mfp, long *offset) {
 
-    long end = count + dataOffst;
     MPI_Status status;
 
     MPI_File_set_view(*mfp, *offset, MPI_CHAR, MPI_CHAR, "native", 
         MPI_INFO_NULL);
 
-    // Writing image partition
-    MPI_File_write(*mfp, (void*) *img, writeAmount, MPI_CHAR, &status);
+    for(int i = 0; i < out->lineCount; i++) {
+        MPI_File_write(*mfp, (void*) &out->lines[i][0], out->lineSizes[i], 
+            MPI_CHAR, &status);
+
+        free(out->lines[i]);
+    }
+
+    free(out->lineSizes);
+    free(out->lines);
 
     return 0;
 }
@@ -437,44 +442,84 @@ long rebuildImage(ImageData img, DataBucket *bucks) {
     return (tsize / 3);
 }
 
-long calculateWriteAmount(char **data, ImageData img, int offset, 
-    int chunksize, int imgWidth) {
+int countDigits(int num) {
 
-    char *buff = NULL, c;
+    int n = 0;
 
-    long i = offset * imgWidth, k = 0L, 
-         end = (chunksize * imgWidth) + i;
-
-    int flip = 0, value = 0, increase = 0;
-
-    long writeAmount = 0L;
-
-    buff = malloc(sizeof(char) * 5 * 3 * img->rsize);
-
-    while(i < end) {
-        switch(flip) {
-            case 0:
-                value = img->R[i];
-                c = ' ';
-                break;
-            case 1:
-                value = img->G[i];
-                c = ' ';
-                break;
-            default:
-                value = img->B[i];
-                c = '\n';
-                i++;
-                break;
-        }
-
-        increase = sprintf(&buff[k], "%d%c", value, c);
-        k += increase;
-        writeAmount += increase;
-        flip = (flip + 1) % 3;
+    while(num) {
+        num /= 10;
+        n++;
     }
 
-    *data = buff;
+    return n;
+}
+
+long calculateWriteAmount(OutputBucket outBuck, ImageData img, int offset, 
+    int chunksize, int imgWidth) {
+
+    char **buff = NULL;
+
+    int chunkSplits[3];
+
+    long i = 0L, k = 0L, end = 0L;
+
+    int increase = 0, digits = countDigits(img->maxcolor), 
+        split, mod, threadId;
+
+    long writeAmount = 0L, *writeAmounts = NULL;
+
+    buff = (char**) malloc(sizeof(char*) * 3);
+    writeAmounts = (long*) calloc(3, sizeof(long));
+
+    mod = chunksize % 3;
+    split = (chunksize-mod) / 3;
+    chunkSplits[0] = chunkSplits[1] = chunkSplits[2] = split;
+
+    if(mod == 1) {
+        chunkSplits[2] += 1;
+    } else if(mod == 2) {
+        chunkSplits[1] += 1;
+        chunkSplits[2] += 1;
+    }
+
+    for(int t = 0; t < 3; t++) {
+        buff[t] = (char*) malloc(sizeof(char) * 
+            ((digits+2) * 3 * imgWidth * chunkSplits[t])+1);
+    }
+
+    #pragma omp parallel private(threadId, i, end, k, increase)
+    {
+        threadId = omp_get_thread_num();
+
+        i = offset * imgWidth;
+
+        for(int t = 0; t < threadId; t++) {
+            i += (chunkSplits[t] * imgWidth);
+        }
+
+        end = i + (chunkSplits[threadId] * imgWidth);
+        k = 0L;
+
+        while(i < end) {
+            increase = sprintf(&buff[threadId][k], "%d %d %d\n", img->R[i], 
+                img->G[i], img->B[i]);
+
+            k += increase;
+            writeAmounts[threadId] += increase;
+            i++;
+        }
+
+    }
+
+    for(int t = 0; t < outBuck->lineCount; t++) {
+        writeAmount += writeAmounts[t];
+    }
+
+    outBuck->lines = buff;
+    buff = NULL;
+
+    outBuck->lineSizes = writeAmounts;
+    writeAmounts = NULL;
 
     return writeAmount;
 }
@@ -513,6 +558,8 @@ int main(int argc, char **argv) {
 
     DataBucket *buckets;
 
+    OutputBucket outBuck;
+
     c = offset = 0;
     position = 0L;
     tstart = tend = tread = tcopy = tconv = tstore = treadk = 0.0;
@@ -521,6 +568,7 @@ int main(int argc, char **argv) {
     mfpsrc = mfpdst = NULL;
     source = output = NULL;
     kern = NULL;
+    outBuck = NULL;
 
     extraSizeFactor = 1.0f;
     
@@ -562,6 +610,10 @@ int main(int argc, char **argv) {
     writeOffs = (long*) malloc(sizeof(long) * pnum);
 
     outData = (char**) malloc(sizeof(char*));
+
+    outBuck = (OutputBucket) malloc(sizeof(struct outbucket));
+
+    outBuck->lineCount = 3;
 
     getcwd(cwd, sizeof(cwd));
 
@@ -623,6 +675,7 @@ int main(int argc, char **argv) {
     
     // Initialize Image output file. Open the file and store the image header
     start = MPI_Wtime();
+
     if(prank == 0) { 
         if (initfilestore(output, &fpdst, outFile, &position) != 0) {
             perror("Error: ");
@@ -701,6 +754,7 @@ int main(int argc, char **argv) {
         
         // Duplicate the image chunk
         start = MPI_Wtime();
+
         if (duplicateImageChunk(source, output) == NULL) {
             perror("Error: ");
             return -1;
@@ -748,11 +802,11 @@ int main(int argc, char **argv) {
             chunkSize = (convSize / imgWidth) - haloSize;
         }
 
-        writeSize = calculateWriteAmount(outData, output, offset, chunkSize, 
+        writeSize = calculateWriteAmount(outBuck, output, offset, chunkSize, 
             imgWidth);
 
         MPI_Allgather((void*) &writeSize, 1, MPI_LONG, (void*) &writeOffs[0], 
-            1, MPI_LONG, MPI_COMM_WORLD);
+            1, MPI_LONG, MPI_COMM_WORLD);     
 
         position = totalWritten;
 
@@ -763,8 +817,7 @@ int main(int argc, char **argv) {
             totalWritten = totalWritten + writeOffs[i];
         }
 
-        if (savingChunk(outData, mfpdst, &position, (offset * imgWidth), 
-                        (chunkSize * imgWidth), writeSize)) {
+        if (savingChunk(outBuck, mfpdst, &position)) {
             perror("Error: ");
             return -1;
         }

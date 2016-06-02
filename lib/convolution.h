@@ -28,7 +28,7 @@ int readChunk(MPI_File*, intmax_t*, intmax_t*, DataBucket);
 void* duplicateImageChunk(ImageData, ImageData);
 KernelData readKernel(char*);
 int initfilestore(ImageData, FILE**, char*, long*);
-int savingChunk(char**, MPI_File*, long*, long, long, long);
+int savingChunk(OutputBucket, MPI_File*, long*);
 int convolve2D(int*, int*, int, int, int, float*, int, int);
 void freeImagestructure(ImageData*);
 

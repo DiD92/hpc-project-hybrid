@@ -81,6 +81,20 @@ struct databucket {
 typedef struct databucket* DataBucket;
 
 //--------------------------------------------------------------------------//
+
+struct outbucket {
+
+    int lineCount;
+
+    long *lineSizes;
+
+    char **lines;
+
+};
+
+typedef struct outbucket* OutputBucket;
+
+//--------------------------------------------------------------------------//
 // -- METHOD DEFINITION --------------------------------------------------- //
 //--------------------------------------------------------------------------//
 
