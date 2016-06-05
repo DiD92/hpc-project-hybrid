@@ -53,6 +53,8 @@ long rebuildImage(ImageData, DataBucket*);
 long calcRasterWriteAmount(int*, long, long);
 long calculateWriteAmount(OutputBucket, ImageData, int, int, int);
 
+int gPrank;
+
 //--------------------------------------------------------------------------//
 // -- LIBRARY IMPLEMENTATION ---------------------------------------------- //
 //--------------------------------------------------------------------------//
@@ -143,11 +145,16 @@ void* duplicateImageChunk(ImageData src, ImageData dst) {
         src->blckSize, sizeof(dst->B[0]), blckInc);
     dst->B = *temp;
 
+    *temp = NULL;
     free(temp);
 
     if(dst->blckSize == -1) {
         return NULL;
     }
+
+    dst->rsize = src->rsize;
+    dst->bsize = src->bsize;
+    dst->gsize = src->gsize;
     
     if(memcpy((void*) dst->R, (void*) src->R, 
         dst->rsize * sizeof(dst->R[0])) == NULL) {
@@ -167,7 +174,7 @@ void* duplicateImageChunk(ImageData src, ImageData dst) {
 // The kernel matrix 2D is stored in 1D format.
 KernelData readKernel(char* fileName) {
     FILE *fp;
-    int ksize = 0;
+    int ksize = 0, tempvalue = 0;
     KernelData kern = NULL;
     
     // Opening the kernel file
@@ -184,7 +191,8 @@ KernelData readKernel(char* fileName) {
         
         // Reading kernel matrix values
         for(int i = 0; i < ksize; i++) {
-            fscanf(fp, "%f,", &kern->vkern[i]);
+            fscanf(fp, "%d,", &tempvalue);
+            kern->vkern[i] = (float) tempvalue;
         }
 
         fclose(fp);
@@ -219,12 +227,7 @@ int savingChunk(OutputBucket out, MPI_File *mfp, long *offset) {
     for(int i = 0; i < out->lineCount; i++) {
         MPI_File_write(*mfp, (void*) &out->lines[i][0], out->lineSizes[i], 
             MPI_CHAR, &status);
-
-        free(out->lines[i]);
     }
-
-    free(out->lineSizes);
-    free(out->lines);
 
     return 0;
 }
@@ -439,6 +442,8 @@ long rebuildImage(ImageData img, DataBucket *bucks) {
             break;
     }
 
+    img->rsize = img->bsize = img->gsize = (tsize / 3);
+
     return (tsize / 3);
 }
 
@@ -457,18 +462,15 @@ int countDigits(int num) {
 long calculateWriteAmount(OutputBucket outBuck, ImageData img, int offset, 
     int chunksize, int imgWidth) {
 
-    char **buff = NULL;
-
     int chunkSplits[3];
 
-    long i = 0L, k = 0L, end = 0L;
+    long i = 0L, k = 0L, end = 0L, baseSize = 0L;
 
     int increase = 0, digits = countDigits(img->maxcolor), 
         split, mod, threadId;
 
     long writeAmount = 0L, *writeAmounts = NULL;
 
-    buff = (char**) malloc(sizeof(char*) * 3);
     writeAmounts = (long*) calloc(3, sizeof(long));
 
     mod = chunksize % 3;
@@ -482,9 +484,13 @@ long calculateWriteAmount(OutputBucket outBuck, ImageData img, int offset,
         chunkSplits[2] += 1;
     }
 
-    for(int t = 0; t < 3; t++) {
-        buff[t] = (char*) malloc(sizeof(char) * 
-            ((digits+2) * 3 * imgWidth * chunkSplits[t])+1);
+    baseSize = (sizeof(char) * (digits+2) * 3 * imgWidth);
+
+    if(outBuck->lines == NULL) {
+        outBuck->lines = (char**) malloc(sizeof(char*) * 3);
+        for(int t = 0; t < 3; t++) {
+            outBuck->lines[t] = (char*) malloc((baseSize * chunkSplits[t]));
+        }
     }
 
     #pragma omp parallel private(threadId, i, end, k, increase)
@@ -501,8 +507,9 @@ long calculateWriteAmount(OutputBucket outBuck, ImageData img, int offset,
         k = 0L;
 
         while(i < end) {
-            increase = sprintf(&buff[threadId][k], "%d %d %d\n", img->R[i], 
-                img->G[i], img->B[i]);
+            
+            increase = sprintf(&(outBuck->lines[threadId])[k], "%d %d %d\n", 
+                img->R[i], img->G[i], img->B[i]);
 
             k += increase;
             writeAmounts[threadId] += increase;
@@ -514,9 +521,6 @@ long calculateWriteAmount(OutputBucket outBuck, ImageData img, int offset,
     for(int t = 0; t < outBuck->lineCount; t++) {
         writeAmount += writeAmounts[t];
     }
-
-    outBuck->lines = buff;
-    buff = NULL;
 
     outBuck->lineSizes = writeAmounts;
     writeAmounts = NULL;
@@ -543,7 +547,7 @@ int main(int argc, char **argv) {
     double start, tstart, tend, tread, tcopy, tconv, tstore, treadk;
     float extraSizeFactor;
 
-    char *sourceFile, *outFile, *kernFile, **outData;
+    char *sourceFile, *outFile, *kernFile;
     char cwd[1024];
 
     FILE *fpsrc, *fpdst;
@@ -599,6 +603,12 @@ int main(int argc, char **argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &pnum);
     MPI_Comm_rank(MPI_COMM_WORLD, &prank);
 
+    gPrank = prank;
+
+    if(gPrank == 0) {
+        printf("PROC COUNT: %d\n", pnum);
+    }
+
     //Storing parameters
     sourceFile = argv[1];
     kernFile = argv[2];
@@ -609,11 +619,11 @@ int main(int argc, char **argv) {
 
     writeOffs = (long*) malloc(sizeof(long) * pnum);
 
-    outData = (char**) malloc(sizeof(char*));
-
     outBuck = (OutputBucket) malloc(sizeof(struct outbucket));
 
     outBuck->lineCount = 3;
+    outBuck->lines = NULL;
+    outBuck->lineSizes = NULL;
 
     getcwd(cwd, sizeof(cwd));
 
@@ -759,6 +769,7 @@ int main(int argc, char **argv) {
             perror("Error: ");
             return -1;
         }
+
         tcopy = tcopy + (MPI_Wtime() - start);
         
         //------------------------------------------------------------------//
@@ -781,7 +792,7 @@ int main(int argc, char **argv) {
                         offset, kern->vkern, kern->kernelX, kern->kernelY);
             }
         }
-        
+
         tconv = MPI_Wtime() - start;
 
         //------------------------------------------------------------------//
@@ -821,8 +832,6 @@ int main(int argc, char **argv) {
             perror("Error: ");
             return -1;
         }
-
-        *outData = NULL;
 
         tstore = tstore + (MPI_Wtime() - start);
 
@@ -896,7 +905,6 @@ int main(int argc, char **argv) {
     free(mfpsrc);
     free(mfpdst);
     free(writeOffs);
-    free(outData);
 
     //----------------------------------------------------------------------//
 

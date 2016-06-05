@@ -215,6 +215,7 @@ void transferUnalignedRasters(int prank, int pnum, DataBucket bucket,
     }
 
     free(buff);
+    free(temp);
 
 }
 
@@ -423,13 +424,13 @@ ImageData parseFileHeader(char* nombre, FILE **fp, int partitions, int halo,
 
         chunk = (long) ((float) chunk * incFactor);
 
-        img->rsize = img->gsize = img->bsize = chunk;
+        img->rsize = img->gsize = img->bsize = 0;
 
         img->blckSize = chunk;
 
-        img->R = calloc(img->rsize, sizeof(int));
-        img->G = calloc(img->gsize, sizeof(int));
-        img->B = calloc(img->bsize, sizeof(int));
+        img->R = calloc(img->blckSize, sizeof(int));
+        img->G = calloc(img->blckSize, sizeof(int));
+        img->B = calloc(img->blckSize, sizeof(int));
         if((img->R == NULL) || (img->G == NULL) || (img->B == NULL) ||
             (img->rastersize == -1)) {
             return NULL;
@@ -460,10 +461,6 @@ ImageData duplicateImageData(ImageData src, int partitions, int halo,
     chunk = chunk + src->width * halo;
 
     chunk = (long) ((float) chunk * incFactor);
-
-    dst->rsize = src->rsize;
-    dst->gsize = src->gsize;
-    dst->bsize = src->bsize;
 
     dst->blckSize = src->blckSize;
 

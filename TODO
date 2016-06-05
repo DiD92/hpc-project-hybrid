@@ -1,3 +1,7 @@
-TODO at 02/06/2016
+TODO at 05/06/2016
 
 -Try to fix convolution algorithm
+
+ERRORS in current branch
+
+-Convolution doesn't respect maxcolor value
